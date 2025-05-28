@@ -1,0 +1,115 @@
+#!/bin/bash
+
+# Git pre-commit hook to run fountainpub locally before commits
+# This runs automatically before each commit, but only when .fountain files are staged
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Check if fountainpub is installed
+if ! command -v fountainpub &>/dev/null; then
+    echo "ℹ️  fountainpub not installed locally - GitHub Actions will handle export"
+    exit 0
+fi
+
+# Function to get the effective timestamp for a file (git or filesystem), normalized to seconds
+get_file_timestamp() {
+    local file="$1"
+
+    # If file doesn't exist, return 0
+    if [ ! -f "$file" ]; then
+        echo "0"
+        return
+    fi
+
+    # Check if file has uncommitted changes (staged or unstaged)
+    if ! git diff --quiet HEAD -- "$file" 2>/dev/null; then
+        # Has uncommitted changes - use filesystem timestamp (truncated to seconds)
+        local fs_time=$(stat -f "%Fm" "$file" 2>/dev/null || echo "0")
+        # Truncate to integer seconds for consistent comparison with git timestamps
+        echo "${fs_time%.*}"
+        return
+    fi
+
+    # No uncommitted changes - try to get git commit timestamp
+    local commit_hash=$(git log -n 1 --format="%H" -- "$file" 2>/dev/null)
+    if [ -n "$commit_hash" ]; then
+        # File is tracked and committed - use git timestamp (already in seconds)
+        git show -s --format="%ct" "$commit_hash" 2>/dev/null || echo "0"
+    else
+        # File is untracked or has no history - use filesystem timestamp (truncated to seconds)
+        local fs_time=$(stat -f "%Fm" "$file" 2>/dev/null || echo "0")
+        # Truncate to integer seconds for consistent comparison with git timestamps
+        echo "${fs_time%.*}"
+    fi
+}
+
+# Function to check if a fountain file needs processing
+needs_fountain_processing() {
+    local fountain_file="$1"
+    local pdf_file="$2"
+    local html_file="$3"
+
+    # If either PDF or HTML doesn't exist, we need processing
+    if [ ! -f "$pdf_file" ] || [ ! -f "$html_file" ]; then
+        return 0
+    fi
+
+    # Get timestamps for all files
+    local fountain_time=$(get_file_timestamp "$fountain_file")
+    local pdf_time=$(get_file_timestamp "$pdf_file")
+    local html_time=$(get_file_timestamp "$html_file")
+
+    # If fountain is newer than or equal to either output, process it
+    # Using >= because generated files might be created in the same clock second
+    if [ "$fountain_time" -ge "$pdf_time" ] || [ "$fountain_time" -ge "$html_time" ]; then
+        return 0
+    fi
+
+    # All up to date
+    return 1
+}
+
+echo "🔍 Checking for .fountain files to process..."
+
+# Find all .fountain files and check if their exports are outdated
+processed_any=false
+temp_file=$(mktemp)
+
+# Use process substitution to avoid subshell issues with variable scope
+while IFS= read -r fountain_file; do
+    dir=$(dirname "$fountain_file")
+    base=$(basename "$fountain_file" .fountain)
+    pdf_file="$dir/$base.pdf"
+    html_file="$dir/$base.html"
+
+    if needs_fountain_processing "$fountain_file" "$pdf_file" "$html_file"; then
+        echo "🔄 Processing: $fountain_file"
+        if fountainpub "$fountain_file" -p -h; then
+            echo "✅ Successfully processed: $(basename "$fountain_file")"
+            # Stage the generated files for the commit
+            if [ -f "$pdf_file" ]; then
+                git add "$pdf_file"
+                echo "📄 Staged: $(basename "$pdf_file")"
+            fi
+            if [ -f "$html_file" ]; then
+                git add "$html_file"
+                echo "🌐 Staged: $(basename "$html_file")"
+            fi
+            echo "processed" >>"$temp_file"
+        else
+            echo "❌ Failed to process: $(basename "$fountain_file")"
+            rm -f "$temp_file"
+            exit 1
+        fi
+    else
+        echo "✅ Up to date: $(basename "$fountain_file")"
+    fi
+done < <(find "$REPO_ROOT" -name "*.fountain" -type f)
+
+if [ -s "$temp_file" ]; then
+    echo "📝 fountainpub processing complete"
+else
+    echo "ℹ️  No .fountain files needed processing"
+fi
+
+rm -f "$temp_file"

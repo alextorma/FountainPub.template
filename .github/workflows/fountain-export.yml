@@ -1,0 +1,178 @@
+# This workflow converts .fountain files to PDF and HTML when needed
+name: Export Fountain to PDF and HTML
+
+on:
+  push:
+    paths:
+      - "**/*.fountain"
+      - ".github/workflows/fountain-export.yml"
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Need full history for commit comparison
+
+      - name: Find .fountain files that need processing
+        id: check-files
+        run: |
+          # Find .fountain files that were included in the most recent push
+          changed_fountain_files=$(git diff --name-only ${{ github.event.before }}..${{ github.sha }} | grep '\.fountain$' || true)
+
+          if [ -z "$changed_fountain_files" ]; then
+            echo "files_to_process=" >> $GITHUB_OUTPUT
+            echo "ℹ️  No .fountain files changed in this push"
+            exit 0
+          fi
+
+          echo "✅ Found changed .fountain files in this push:"
+          echo "$changed_fountain_files"
+
+          # Filter only .fountain files that DO NOT have pdf and html OR fountain was committed more recently
+          files_to_process=""
+
+          while IFS= read -r fountain_file; do
+            [ -z "$fountain_file" ] && continue
+
+            dir=$(dirname "$fountain_file")
+            base=$(basename "$fountain_file" .fountain)
+            pdf_file="$dir/$base.pdf"
+            html_file="$dir/$base.html"
+
+            needs_processing=false
+
+            # Check if PDF or HTML are missing
+            if [ ! -f "$pdf_file" ] || [ ! -f "$html_file" ]; then
+              needs_processing=true
+              echo "📄 Missing files for: $fountain_file"
+            else
+              # Check git history to see if fountain was committed more recently than outputs
+              fountain_commit=$(git log -n 1 --format="%H" -- "$fountain_file" 2>/dev/null)
+              pdf_commit=$(git log -n 1 --format="%H" -- "$pdf_file" 2>/dev/null)
+              html_commit=$(git log -n 1 --format="%H" -- "$html_file" 2>/dev/null)
+
+              if [ -n "$fountain_commit" ]; then
+                fountain_time=$(git show -s --format="%ct" "$fountain_commit" 2>/dev/null)
+
+                # Check PDF
+                if [ -z "$pdf_commit" ]; then
+                  needs_processing=true
+                  echo "📄 PDF not tracked for: $fountain_file"
+                else
+                  pdf_time=$(git show -s --format="%ct" "$pdf_commit" 2>/dev/null)
+                  if [ "$fountain_time" -gt "$pdf_time" ]; then
+                    needs_processing=true
+                    echo "📄 PDF outdated for: $fountain_file"
+                  fi
+                fi
+
+                # Check HTML
+                if [ -z "$html_commit" ]; then
+                  needs_processing=true
+                  echo "🌐 HTML not tracked for: $fountain_file"
+                else
+                  html_time=$(git show -s --format="%ct" "$html_commit" 2>/dev/null)
+                  if [ "$fountain_time" -gt "$html_time" ]; then
+                    needs_processing=true
+                    echo "🌐 HTML outdated for: $fountain_file"
+                  fi
+                fi
+              fi
+            fi
+
+            if [ "$needs_processing" = true ]; then
+              if [ -z "$files_to_process" ]; then
+                files_to_process="$fountain_file"
+              else
+                files_to_process="$files_to_process"$'\n'"$fountain_file"
+              fi
+              echo "📄 Needs processing: $fountain_file"
+            else
+              echo "✅ Up to date: $fountain_file"
+            fi
+          done <<< "$changed_fountain_files"
+
+          # Output the filtered list
+          if [ -n "$files_to_process" ]; then
+            echo "files_to_process<<EOF" >> $GITHUB_OUTPUT
+            echo "$files_to_process" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            echo "🔄 Found $(echo "$files_to_process" | wc -l) files that need processing"
+          else
+            echo "files_to_process=" >> $GITHUB_OUTPUT
+            echo "✅ All .fountain files already have up-to-date exports"
+          fi
+
+      - name: Set up Node.js
+        if: steps.check-files.outputs.files_to_process != ''
+        uses: actions/setup-node@v3
+        with:
+          node-version: "18"
+
+      - name: Install fountainpub
+        if: steps.check-files.outputs.files_to_process != ''
+        run: npm install -g fountainpub
+
+      - name: Process .fountain files
+        if: steps.check-files.outputs.files_to_process != ''
+        run: |
+          files_to_process="${{ steps.check-files.outputs.files_to_process }}"
+
+          echo "🔄 Processing files that need updating..."
+          while IFS= read -r fountain_file; do
+            [ -z "$fountain_file" ] && continue
+            echo "📄 Processing: $fountain_file"
+            if fountainpub "$fountain_file" -p -h; then
+              echo "✅ Successfully processed: $fountain_file"
+            else
+              echo "❌ Failed to process: $fountain_file"
+              exit 1
+            fi
+          done <<< "$files_to_process"
+
+      - name: Commit and push exported files
+        if: steps.check-files.outputs.files_to_process != ''
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Add any generated files that exist
+          git add . || echo "No files to add"
+
+          # Check what we're committing
+          git status
+
+          if git diff --staged --quiet; then
+              echo "ℹ️  No changes to commit"
+          else
+              git commit -m "Auto-export Fountain to PDF and HTML [skip ci]"
+              git push
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: List export directory contents
+        if: steps.check-files.outputs.files_to_process != ''
+        run: |
+          echo "Export directory contents:"
+          find . -type f \( -name "*.pdf" -o -name "*.html" \) | sort
+
+      - name: Upload exports as artifact
+        if: steps.check-files.outputs.files_to_process != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: fountain-exports-${{ github.sha }}
+          path: |
+            **/*.pdf
+            **/*.html
+          retention-days: 30
+
+      - name: List generated files
+        if: steps.check-files.outputs.files_to_process != ''
+        run: |
+          echo "Generated files:"
+          find . -type f \( -name "*.pdf" -o -name "*.html" \) | sort

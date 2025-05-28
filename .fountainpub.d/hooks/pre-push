@@ -1,0 +1,93 @@
+#!/bin/bash
+
+# Git pre-push hook to start fountain sync daemon in background
+# This runs automatically before pushing changes
+# Only starts daemon if:
+#   1. There are actually files being pushed AND
+#   2. Either workflow changes OR fountain files are newer than their PDF/HTML outputs
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+DAEMON_SCRIPT="$REPO_ROOT/.fountainpub.d/start-auto-sync.sh"
+DAEMON_MAIN="$REPO_ROOT/.fountainpub.d/fountain-auto-sync-daemon.sh"
+PIDFILE="$REPO_ROOT/.fountainpub.d/.fountain-auto-sync.pid"
+
+# Check what files are being pushed
+files_to_push=$(git diff --name-only @{upstream}..HEAD 2>/dev/null || git diff --name-only HEAD~1..HEAD 2>/dev/null || echo "")
+
+# Exit early if no files to push
+if [[ -z "$files_to_push" ]]; then
+    echo "ℹ️  No files to push - no daemon needed"
+    exit 0
+fi
+
+fountain_files_changed=()
+workflow_changed=false
+
+while IFS= read -r file; do
+    if [[ -n "$file" ]]; then # Skip empty lines
+        if [[ "$file" == *.fountain ]]; then
+            fountain_files_changed+=("$file")
+        elif [[ "$file" == ".github/workflows/fountain-export.yml" ]]; then
+            workflow_changed=true
+        fi
+    fi
+done <<<"$files_to_push"
+
+# Start daemon if:
+# 1. Workflow changes OR
+# 2. Fountain files changed AND their PDF/HTML are NOT newer than fountain files
+
+should_start_daemon=false
+
+# Check condition 1: workflow changes
+if [[ "$workflow_changed" == true ]]; then
+    echo "🔄 Workflow changes detected - daemon needed"
+    should_start_daemon=true
+# Check condition 2: fountain files with outdated outputs
+elif [[ ${#fountain_files_changed[@]} -gt 0 ]]; then
+    echo "📝 Fountain files changed: ${fountain_files_changed[*]}"
+
+    # Check if any fountain files have PDF/HTML that are NOT newer than the fountain file
+    for fountain_file in "${fountain_files_changed[@]}"; do
+        pdf_file="${fountain_file%.fountain}.pdf"
+        html_file="${fountain_file%.fountain}.html"
+
+        # If PDF or HTML don't exist OR fountain file is newer than outputs
+        if [[ ! -f "$pdf_file" ]] || [[ ! -f "$html_file" ]] || [[ "$fountain_file" -nt "$pdf_file" ]] || [[ "$fountain_file" -nt "$html_file" ]]; then
+            echo "📄 Outputs for $fountain_file are missing or outdated - daemon needed"
+            should_start_daemon=true
+            break
+        fi
+    done
+
+    if [[ "$should_start_daemon" == false ]]; then
+        echo "✅ All fountain files have newer PDF/HTML outputs - no daemon needed"
+    fi
+else
+    echo "ℹ️  No fountain files or workflow changes in this push - no daemon needed"
+fi
+
+if [[ "$should_start_daemon" == false ]]; then
+    exit 0
+fi
+
+# Check if daemon is already running
+if [ -f "$PIDFILE" ]; then
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$pid" ] && ps -p "$pid" >/dev/null 2>&1; then
+        echo "🔄 Fountain auto-sync daemon already running (PID: $pid)"
+        exit 0
+    else
+        # Remove stale PID file
+        rm -f "$PIDFILE"
+    fi
+fi
+
+if [ -f "$DAEMON_SCRIPT" ]; then
+    echo "🚀 Starting fountain auto-sync daemon in background..."
+    # Run in background and detach from terminal
+    nohup "$DAEMON_SCRIPT" >/dev/null 2>&1 &
+    echo "✅ Daemon started (PID: $!)"
+else
+    echo "Warning: Fountain auto-sync script not found at $DAEMON_SCRIPT"
+fi

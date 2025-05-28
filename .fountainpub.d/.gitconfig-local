@@ -1,0 +1,12 @@
+[core]
+# Use the custom hooks directory for fountainpub automation
+# Set in the setup script because
+# hooksPath = "$(git rev-parse --show-toplevel)/.fountainpub.d/hooks"
+
+[alias]
+# Manual sync commands for convenience
+sync-start = "!\"$(git rev-parse --show-toplevel)/.fountainpub.d/start-auto-sync.sh\""
+sync-stop = "!\"$(git rev-parse --show-toplevel)/.fountainpub.d/fountain-auto-sync-daemon.sh\" stop"
+sync-status = "!\"$(git rev-parse --show-toplevel)/.fountainpub.d/fountain-auto-sync-daemon.sh\" status"
+# Force run fountainpub on all .fountain files
+fountain-export = "!f() { find \"$(git rev-parse --show-toplevel)\" -name '*.fountain' -type f -exec fountainpub {} -p -h \\;; }; f"
